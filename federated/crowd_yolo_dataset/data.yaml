@@ -1,0 +1,5 @@
+path: C:\Users\user\OneDrive\Desktop\Capstone project\federated\crowd_yolo_dataset
+train: images/train
+val: images/val
+names:
+  0: person
