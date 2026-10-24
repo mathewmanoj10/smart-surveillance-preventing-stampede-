@@ -13,6 +13,8 @@ import torch.optim as optim
 
 from utils.density_utils import calculate_density, FPSCounter
 from models.simple_model import SimpleDensityModel
+from utils.scene_profiles import SceneAnalyzer
+from utils.regulation import RegulationController
 
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -21,9 +23,9 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # Motion / risk constants
 MOVING_THRESHOLD = 0.3     # m/s, slower pixels are treated as standing
 MIN_MOVER_PEOPLE = 2.0     # people-equivalents needed to trust direction variance
-W_DENSITY, W_SPEED, W_DIR, W_INTERACT = 0.50, 0.25, 0.25, 0.0
+W_DENSITY, W_SPEED, W_DIR, W_INTERACT = 0.35, 0.25, 0.20, 0.20
 EMA_ALPHA = 0.30
-LOW_T, HIGH_T = 0.35, 0.45
+LOW_T, HIGH_T = 0.35, 0.65
 
 # Smoothing for the raw optical-flow readings (reduces frame-to-frame jitter)
 MOTION_EMA = 0.40
@@ -31,6 +33,14 @@ MOTION_EMA = 0.40
 # Heatmap display
 HEAT_EMA = 0.25            # how fast the heatmap fades toward a new CSRNet result
 HEAT_MIN = 0.12            # fraction of peak density below which nothing is tinted
+
+# Heatmap colour scheme. Try any of:
+#   cv2.COLORMAP_JET      blue -> green -> yellow -> red   (classic crowd look)
+#   cv2.COLORMAP_TURBO    smoother version of JET
+#   cv2.COLORMAP_HOT      black -> red -> yellow -> white  (no blue)
+#   cv2.COLORMAP_INFERNO  black -> purple -> orange -> yellow
+#   cv2.COLORMAP_OCEAN    dark -> blue/teal -> white       (blue-toned)
+HEAT_COLORMAP = cv2.COLORMAP_JET
 
 
 def clip01(x):
@@ -61,6 +71,12 @@ class LocalClient:
         async_inference=True,    # run CSRNet in a background thread (display mode)
         pace_to_video=True,      # play back at the video's own FPS
         display_width=1280,      # downscale frames wider than this for display only
+        scene="public_street",   # key of SCENE_PROFILES (utils/scene_profiles.py)
+        zone_polygon=None,       # [(x, y), ...] normalized 0..1 (roadway, platform edge...)
+        vehicle_model=None,      # loaded YOLO11 model (road-type scenes only)
+        show_vehicle_boxes=False,
+        regulate=True,           # run the SIMULATED regulation controller
+        approval="operator",     # "operator" = press A/X, "auto" = no prompts
     ):
         self.client_id = client_id
         self.video_path = video_path
@@ -81,6 +97,32 @@ class LocalClient:
         self.csv_dir = csv_dir
         self.pace_to_video = pace_to_video
         self.display_width = display_width
+
+        # Scene profile: sets this camera's thresholds and decides which
+        # extra measurements (vehicles, restricted zone) are made.
+        self.scene = SceneAnalyzer(
+            scene,
+            zone_polygon=zone_polygon,
+            vehicle_model=vehicle_model,
+            draw_vehicles=show_vehicle_boxes,
+        )
+        self.density_critical = self.scene.density_critical
+        self.speed_critical = self.scene.speed_critical
+        self.low_t = self.scene.low_t
+        self.high_t = self.scene.high_t
+
+        # Simulated regulation: turns the alert level into control actions.
+        # Without a display there is nobody to press A/X, so it auto-approves.
+        self.controller = None
+
+        if regulate:
+            tag = self.client_id.replace(" ", "_")
+            self.controller = RegulationController(
+                scene,
+                log_path=os.path.join(csv_dir, f"{tag}_actions.csv"),
+                title=f"Control panel (simulated) - {self.client_id}",
+                approval=approval if display else "auto",
+            )
 
         # Background inference only makes sense for live playback. For offline
         # runs (display=False) the loop runs as fast as possible, so we keep
@@ -216,7 +258,13 @@ class LocalClient:
 
         return float(max(float(count), 0.0)), dm
 
-    def _apply_estimate(self, raw_count, dm, in_size):
+    def _run_jobs(self, frame):
+        """Everything heavy for one frame: crowd density + (optional) vehicles."""
+        raw_count, dm, in_size = self._estimate_crowd(frame)
+        vehicles = self.scene.detect_vehicles(frame)
+        return raw_count, dm, in_size, vehicles
+
+    def _apply_estimate(self, raw_count, dm, in_size, vehicles=None):
         """Store a fresh CSRNet result (always called from the main thread)."""
         self.count_buffer.append(raw_count)
         self._dm_version += 1
@@ -224,6 +272,14 @@ class LocalClient:
         self._in_size = in_size
         self._peak_density = self._peak_density_from_map(dm)
         self._update_flow_weights(dm)
+
+        self.scene.update(
+            dm,
+            float(np.mean(self.count_buffer)),
+            vehicles,
+            (self.orig_w, self.orig_h),
+            (self.flow_w, self.flow_h),
+        )
 
     # ------------------------------------------------------
     # BACKGROUND INFERENCE THREAD
@@ -245,7 +301,7 @@ class LocalClient:
                 continue
 
             try:
-                result = self._estimate_crowd(frame)
+                result = self._run_jobs(frame)
             except Exception as error:   # re-raised in the main thread
                 result = error
 
@@ -379,9 +435,9 @@ class LocalClient:
 
         r = self._risk_smooth
 
-        if r < LOW_T:
+        if r < self.low_t:
             level, color = "LOW", (0, 255, 0)
-        elif r < HIGH_T:
+        elif r < self.high_t:
             level, color = "MEDIUM", (0, 165, 255)
         else:
             level, color = "HIGH", (0, 0, 255)
@@ -427,7 +483,7 @@ class LocalClient:
         norm = np.clip(self._heat_cur / self._heat_peak, 0.0, 1.0)
         norm8 = (norm * 255).astype(np.uint8)
 
-        heat = cv2.applyColorMap(norm8, cv2.COLORMAP_JET)
+        heat = cv2.applyColorMap(norm8, HEAT_COLORMAP)
         mask = (norm >= HEAT_MIN).astype(np.uint8) * 255
 
         # Upscale only the final images to the frame size
@@ -461,6 +517,7 @@ class LocalClient:
 
         # Geometry for converting pixels to metres
         self.orig_w = width
+        self.orig_h = height
         if self.px_per_meter is None:
             # Assumption: the frame spans about 20 m. CALIBRATE for real numbers.
             self.px_per_meter = width / 20.0
@@ -504,7 +561,7 @@ class LocalClient:
         csv_w.writerow([
             "frame", "time_s", "people", "peak_density_pm2", "speed_ms",
             "direction_variance", "risk_raw", "risk_smooth", "level",
-        ])
+        ] + self.scene.csv_header())
 
         if self.display:
             cv2.namedWindow(self.client_id, cv2.WINDOW_NORMAL)
@@ -531,7 +588,7 @@ class LocalClient:
                 # ---- CSRNet ----
                 if self._dm is None:
                     # first frame: run once synchronously so we have a map
-                    self._apply_estimate(*self._estimate_crowd(frame))
+                    self._apply_estimate(*self._run_jobs(frame))
                     last_submit = frame_index
 
                 elif self.async_inference:
@@ -544,7 +601,7 @@ class LocalClient:
                         last_submit = frame_index
 
                 elif frame_index % self.count_every == 0:
-                    self._apply_estimate(*self._estimate_crowd(frame))
+                    self._apply_estimate(*self._run_jobs(frame))
 
                 smooth_count = int(round(float(np.mean(self.count_buffer))))
 
@@ -575,6 +632,23 @@ class LocalClient:
                     self._peak_density, speed, dir_var
                 )
 
+                # Scene rules (restricted zone, traffic) can raise the level
+                level, color, alerts = self.scene.apply_rules(level, color)
+                self.scene.record()
+
+                # Simulated regulation (uses VIDEO time so results do not
+                # depend on how fast this computer processes the video)
+                if self.controller is not None:
+                    self.controller.update(
+                        frame_index / fps_video, frame_index, level,
+                        {
+                            "people": smooth_count,
+                            "density": self._peak_density,
+                            "zone": self.scene.zone_people,
+                            "risk": risk * 100.0,
+                        },
+                    )
+
                 fps = self.fps_counter.update()
                 self.fps_window.append(fps)
                 fps_avg = float(np.mean(self.fps_window))
@@ -595,30 +669,40 @@ class LocalClient:
                     smooth_count, round(self._peak_density, 3),
                     round(speed, 3), round(dir_var, 3),
                     round(raw, 4), round(risk, 4), level,
-                ])
+                ] + self.scene.csv_row())
 
                 if self.show_heatmap:
                     frame = self._overlay_heatmap(frame, self._dm)
 
-                lines = [
-                    self.client_id,
-                    f"People: {smooth_count}",
-                    f"Peak density: {self._peak_density:.2f} /m2",
-                    f"Speed: {speed:.2f} m/s",
-                    f"Direction var: {dir_var:.2f}",
-                    f"RISK: {risk * 100:.0f}/100 ({level})",
-                    f"FPS: {fps_avg:.1f}",
-                ]
+                # zone outline (and vehicle boxes if enabled)
+                self.scene.draw(frame)
 
-                cv2.rectangle(frame, (5, 5), (360, 12 + 27 * len(lines)),
+                white = (255, 255, 255)
+                lines = [
+                    (self.client_id, white),
+                    (f"Scene: {self.scene.label}", white),
+                    (f"People: {smooth_count}", white),
+                    (f"Peak density: {self._peak_density:.2f} /m2", white),
+                    (f"Speed: {speed:.2f} m/s", white),
+                    (f"Direction var: {dir_var:.2f}", white),
+                ]
+                lines += self.scene.overlay_lines()
+                lines.append((f"RISK: {risk * 100:.0f}/100 ({level})", color))
+                lines += [(a, (60, 60, 255)) for a in alerts]
+                lines.append((f"FPS: {fps_avg:.1f}", white))
+
+                cv2.rectangle(frame, (5, 5), (420, 12 + 27 * len(lines)),
                               (35, 35, 35), -1)
 
-                for i, text in enumerate(lines):
+                for i, (text, text_color) in enumerate(lines):
                     cv2.putText(
                         frame, text, (15, 30 + 27 * i),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        color if i == 5 else (255, 255, 255), 2,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2,
                     )
+
+                # status bar with the simulated control actions
+                if self.controller is not None:
+                    self.controller.draw_banner(frame)
 
                 if writer is not None:
                     writer.write(frame)
@@ -646,7 +730,15 @@ class LocalClient:
                     else:
                         wait_ms = 1
 
-                    if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
+                    if self.controller is not None:
+                        self.controller.show_window()
+
+                    key = cv2.waitKey(wait_ms) & 0xFF
+
+                    if self.controller is not None:
+                        self.controller.handle_key(key)
+
+                    if key == ord("q"):
                         break
 
                 frame_index += 1
@@ -655,6 +747,9 @@ class LocalClient:
             self._stop_worker()
             cap.release()
             csv_file.close()
+
+            if self.controller is not None:
+                self.controller.close()
 
             if writer is not None:
                 writer.release()
@@ -734,6 +829,7 @@ class LocalClient:
             "avg_risk": avg("risk_scores"),
             "max_risk": float(max(s["risk_scores"])) if s["risk_scores"] else 0.0,
             "avg_fps": avg("fps_values"),
+            **self.scene.summary(),
         }
 
     def get_summary(self):
@@ -752,3 +848,19 @@ class LocalClient:
         print(f"  Avg risk         : {u['avg_risk']:.1f}/100")
         print(f"  Max risk         : {u['max_risk']:.1f}/100")
         print(f"  Avg FPS          : {u['avg_fps']:.1f}")
+        print(f"  Scene            : {self.scene.label}")
+
+        if self.scene.track_vehicles:
+            print(f"  Avg vehicles     : {u['avg_vehicles']:.1f} "
+                  f"(occupancy {u['avg_vehicle_occupancy'] * 100:.0f}%)")
+
+        if self.scene.zone_polygon is not None:
+            print(f"  {self.scene.zone_label:<16} : avg "
+                  f"{u['avg_zone_people']:.1f} / max "
+                  f"{u['max_zone_people']:.1f} people")
+
+        if self.controller is not None:
+            c = self.controller.summary()
+            print(f"  Control actions  : {c['actions_triggered']} triggered "
+                  f"(highest level held: {c['max_level']})")
+            print(f"  Action log       : {self.controller.log_path}")

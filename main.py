@@ -10,6 +10,7 @@ from federated.fed_avg import (
 )
 from models.simple_model import SimpleDensityModel
 from models.csrnet import load_csrnet
+from utils.scene_profiles import SCENE_PROFILES
 
 
 # ============================================================
@@ -22,12 +23,33 @@ VIDEO_PATHS = [
     os.path.join(
         VIDEO_DIR,
         "stampede",
-        "gettyimages-2234292699-640_adpp.mp4" \
- \
+        "gettyimages-2234292699-640_adpp.mp4",
     )
 ]
 
 CLIENT_NAMES = ["Camera 1"]
+
+# Scene type for each camera. Options (see utils/scene_profiles.py):
+#   "public_street", "road_traffic", "railway_platform",
+#   "event_venue", "religious_gathering"
+CLIENT_SCENES = ["public_street"]
+
+# Restricted zone for each camera (roadway, platform edge, entrance...).
+# None = no zone. Otherwise a list of normalized (x, y) points, 0..1.
+# Get them by running:  python pick_zone.py "<video path>"
+# Example: [(0.10, 0.60), (0.90, 0.60), (0.95, 0.95), (0.05, 0.95)]
+CLIENT_ZONES = [None]
+
+# Vehicle detector, only loaded if a camera uses a scene that tracks vehicles
+VEHICLE_WEIGHTS = "yolo11n.pt"
+SHOW_VEHICLE_BOXES = False   # boxes update with CSRNet, so they can look laggy
+
+# SIMULATED regulation controller (signs, announcements, gate holds...).
+# Nothing here controls real hardware; actions are shown on screen and
+# written to outputs/<camera>_actions.csv.
+REGULATE = True
+APPROVAL = "operator"        # "operator" = press A/X in the video window
+                             # "auto"     = actions activate without prompts
 
 # Optional training labels (training only): 0.0 = normal, 1.0 = stampede.
 # Use None to train on the formula risk instead.
@@ -39,7 +61,7 @@ COUNT_EVERY = 8          # run CSRNet once every N frames
 PX_PER_METER = None      # CALIBRATE: pixels per metre in the crowd area
 
 DISPLAY = True
-SHOW_HEATMAP = True 
+SHOW_HEATMAP = False
 
 CSRNET_WEIGHTS = os.path.join("weights", "PartAmodel_best.pth.tar")
 LWCC_WEIGHTS = "SHA"
@@ -91,6 +113,40 @@ def load_counting_model():
 
 
 # ============================================================
+# LOAD VEHICLE MODEL (only for road-type scenes)
+# ============================================================
+
+def load_vehicle_model(scenes):
+    """Loads YOLO11 only if at least one camera needs vehicle tracking."""
+
+    needs_vehicles = any(
+        SCENE_PROFILES[s].get("track_vehicles") for s in scenes
+    )
+
+    if not needs_vehicles:
+        return None
+
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("[WARNING] Vehicle tracking needs: pip install ultralytics")
+        return None
+
+    path = os.path.join("federated", VEHICLE_WEIGHTS)
+
+    if not os.path.isfile(path):
+        path = VEHICLE_WEIGHTS   # ultralytics downloads it if internet is on
+
+    try:
+        model = YOLO(path)
+        print("Vehicle model loaded:", path)
+        return model
+    except Exception as error:
+        print("[WARNING] Could not load vehicle model:", error)
+        return None
+
+
+# ============================================================
 # FEDERATED PIPELINE
 # ============================================================
 
@@ -101,11 +157,20 @@ def run_federated_pipeline():
     print("Device:", DEVICE)
     print("=" * 60)
 
+    # Validate scene names early so a typo fails with a clear message
+    for scene in CLIENT_SCENES:
+        if scene not in SCENE_PROFILES:
+            print(f"[ERROR] Unknown scene '{scene}'. "
+                  f"Choose from: {', '.join(SCENE_PROFILES)}")
+            return
+
     try:
         count_model, backend_type = load_counting_model()
     except Exception as error:
         print("[ERROR]", error)
         return
+
+    vehicle_model = load_vehicle_model(CLIENT_SCENES)
 
     clients = []
     labels = []
@@ -122,6 +187,13 @@ def run_federated_pipeline():
             else f"Camera {index + 1}"
         )
 
+        scene = (
+            CLIENT_SCENES[index]
+            if index < len(CLIENT_SCENES)
+            else "public_street"
+        )
+
+        zone = CLIENT_ZONES[index] if index < len(CLIENT_ZONES) else None
         label = CLIENT_LABELS[index] if index < len(CLIENT_LABELS) else None
 
         clients.append(
@@ -136,6 +208,12 @@ def run_federated_pipeline():
                 show_heatmap=SHOW_HEATMAP,
                 count_every=COUNT_EVERY,
                 px_per_meter=PX_PER_METER,
+                scene=scene,
+                zone_polygon=zone,
+                vehicle_model=vehicle_model,
+                show_vehicle_boxes=SHOW_VEHICLE_BOXES,
+                regulate=REGULATE,
+                approval=APPROVAL,
             )
         )
         labels.append(label)
@@ -150,7 +228,8 @@ def run_federated_pipeline():
 
     for client, label in zip(clients, labels):
 
-        print(f"\nProcessing: {client.client_id}")
+        print(f"\nProcessing: {client.client_id} "
+              f"(scene: {client.scene.label})")
 
         try:
             summary = client.process_video(max_frames=MAX_FRAMES)
@@ -302,4 +381,4 @@ if __name__ == "__main__":
     elif choice == "2":
         run_federated_pipeline()
     else:
-        print("Invalid choice.") 
+        print("Invalid choice.")

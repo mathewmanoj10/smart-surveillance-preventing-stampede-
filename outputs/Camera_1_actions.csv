@@ -1,0 +1,3 @@
+time_s,frame,scene,held_level,action,status,reason
+3.14,94,public_street,MEDIUM,-,LEVEL_CHANGE,"people=262, density=4.05/m2, zone=0, risk=44"
+3.14,94,public_street,MEDIUM,advisory_announcement,ACTIVATED,"people=262, density=4.05/m2, zone=0, risk=44"
