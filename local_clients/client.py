@@ -77,6 +77,7 @@ class LocalClient:
         show_vehicle_boxes=False,
         regulate=True,           # run the SIMULATED regulation controller
         approval="operator",     # "operator" = press A/X, "auto" = no prompts
+        ui_scale=1.0,            # size of the on-screen dashboard (0.7 = smaller)
     ):
         self.client_id = client_id
         self.video_path = video_path
@@ -97,6 +98,7 @@ class LocalClient:
         self.csv_dir = csv_dir
         self.pace_to_video = pace_to_video
         self.display_width = display_width
+        self.ui_scale = float(ui_scale)
 
         # Scene profile: sets this camera's thresholds and decides which
         # extra measurements (vehicles, restricted zone) are made.
@@ -691,13 +693,28 @@ class LocalClient:
                 lines += [(a, (60, 60, 255)) for a in alerts]
                 lines.append((f"FPS: {fps_avg:.1f}", white))
 
-                cv2.rectangle(frame, (5, 5), (420, 12 + 27 * len(lines)),
-                              (35, 35, 35), -1)
+                # The dashboard size follows the frame width, so it looks
+                # similar on a 640 px and a 1920 px video. Change ui_scale
+                # (main.py: UI_SCALE) to make it bigger or smaller.
+                s = max(0.45, (width / 1280.0) * self.ui_scale)
+                line_h = int(round(27 * s))
+                font_size = 0.6 * s
+                thickness = max(1, int(round(2 * s)))
+                panel_w = int(420 * s)
+                pad = int(10 * s)
+
+                cv2.rectangle(
+                    frame, (5, 5),
+                    (5 + panel_w, 5 + 2 * pad + line_h * len(lines)),
+                    (35, 35, 35), -1,
+                )
 
                 for i, (text, text_color) in enumerate(lines):
                     cv2.putText(
-                        frame, text, (15, 30 + 27 * i),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2,
+                        frame, text,
+                        (5 + pad, 5 + pad + int(line_h * 0.8) + line_h * i),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_size, text_color,
+                        thickness,
                     )
 
                 # status bar with the simulated control actions
@@ -766,7 +783,8 @@ class LocalClient:
     # LOCAL TRAINING (federated demo)
     # ------------------------------------------------------
 
-    def simulate_local_training(self, epochs=30, target_label=None):
+    def simulate_local_training(self, epochs=30, target_label=None,
+                                verbose=True):
         """
         Train the small model to map [D, S, V] -> risk.
         target_label: optional constant label (e.g. 0.0 for a normal video,
@@ -798,10 +816,45 @@ class LocalClient:
             loss.backward()
             optimizer.step()
 
-        print(
-            f"[{self.client_id}] Local training complete "
-            f"(final loss: {loss.item():.4f})"
+        if verbose:
+            print(
+                f"[{self.client_id}] Local training complete "
+                f"(final loss: {loss.item():.4f})"
+            )
+
+        return float(loss.item())
+
+    def set_model_weights(self, state):
+        """Receive the global model from the server."""
+        self.local_model.load_state_dict(
+            {k: v.clone() for k, v in state.items()}
         )
+
+    def evaluate_state(self, state, target_label=None):
+        """
+        MSE of a given model on THIS client's own private features.
+        The data never leaves the client; only this number is reported.
+        Uses the same targets as training.
+        """
+        feats = self.local_stats["features"]
+
+        if not feats:
+            return None
+
+        x = torch.tensor(feats, dtype=torch.float32)
+
+        if target_label is None:
+            y = torch.tensor(self.local_stats["risk_unit"],
+                             dtype=torch.float32).unsqueeze(1)
+        else:
+            y = torch.full((len(feats), 1), float(target_label))
+
+        model = SimpleDensityModel(input_size=3, hidden_size=8, output_size=1)
+        model.load_state_dict(state)
+        model.eval()
+
+        with torch.no_grad():
+            return float(nn.MSELoss()(model(x), y))
 
     def get_model_weights(self):
         return {

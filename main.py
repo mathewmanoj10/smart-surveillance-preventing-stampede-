@@ -4,9 +4,12 @@ import torch
 
 from local_clients.client import LocalClient
 from federated.fed_avg import (
-    federated_average,
     aggregate_risk,
     print_risk_report,
+)
+from federated.fed_rounds import (
+    run_federated_rounds,
+    compare_local_vs_global,
 )
 from models.simple_model import SimpleDensityModel
 from models.csrnet import load_csrnet
@@ -19,26 +22,47 @@ from utils.scene_profiles import SCENE_PROFILES
 
 VIDEO_DIR = os.path.join("federated", "videos")
 
+# One entry per camera. Each camera is a federated CLIENT: its video and
+# features stay on that client; only model weights are shared.
+# To really see federation, use 2 or more cameras, for example one calm
+# crowd video and one stampede video. Keep the lists below the same length.
 VIDEO_PATHS = [
     os.path.join(
         VIDEO_DIR,
         "stampede",
         "gettyimages-2234292699-640_adpp.mp4",
-    )
+    ),
+    os.path.join(
+            VIDEO_DIR,
+            "normal",
+            "Camera_2_output.mp4",
+        ),
+           
+    # os.path.join(VIDEO_DIR, "normal", "your_calm_crowd_video.mp4"),
 ]
 
-CLIENT_NAMES = ["Camera 1"]
+CLIENT_NAMES = ["Camera 1","Camera 2"]            # add "Camera 2", ...
 
 # Scene type for each camera. Options (see utils/scene_profiles.py):
 #   "public_street", "road_traffic", "railway_platform",
 #   "event_venue", "religious_gathering"
-CLIENT_SCENES = ["public_street"]
+CLIENT_SCENES = ["public_street"]      # add one per camera
 
-# Restricted zone for each camera (roadway, platform edge, entrance...).
-# None = no zone. Otherwise a list of normalized (x, y) points, 0..1.
-# Get them by running:  python pick_zone.py "<video path>"
-# Example: [(0.10, 0.60), (0.90, 0.60), (0.95, 0.95), (0.05, 0.95)]
-CLIENT_ZONES = [None]
+# Restricted zone for each camera. None = no zone. Otherwise a list of
+# normalized (x, y) points, 0..1. Get them with: python pick_zone.py "<video>"
+CLIENT_ZONES = [None]                  # add one per camera
+
+# Training label per camera (used for federated training only):
+#   1.0 = stampede / dangerous video, 0.0 = calm video,
+#   None = use the formula risk (nothing new to learn, demo only).
+# For two cameras (stampede + calm), use [1.0, 0.0].
+CLIENT_LABELS = [None]                 # add one per camera
+
+# ---- Federated learning settings ----
+FED_ROUNDS = 10              # communication rounds
+LOCAL_EPOCHS = 5             # training epochs per client per round
+DP_CLIP_NORM = None          # e.g. 1.0 = clip each client's update
+DP_NOISE_MULTIPLIER = 0.0    # e.g. 0.5 = add noise (needs DP_CLIP_NORM)
 
 # Vehicle detector, only loaded if a camera uses a scene that tracks vehicles
 VEHICLE_WEIGHTS = "yolo11n.pt"
@@ -51,17 +75,14 @@ REGULATE = True
 APPROVAL = "operator"        # "operator" = press A/X in the video window
                              # "auto"     = actions activate without prompts
 
-# Optional training labels (training only): 0.0 = normal, 1.0 = stampede.
-# Use None to train on the formula risk instead.
-CLIENT_LABELS = [None]
-
 MAX_FRAMES = None        # None = whole video
 MAX_SIDE = 512           # CSRNet input size (smaller = faster)
 COUNT_EVERY = 8          # run CSRNet once every N frames
 PX_PER_METER = None      # CALIBRATE: pixels per metre in the crowd area
 
 DISPLAY = True
-SHOW_HEATMAP = False
+SHOW_HEATMAP = True
+UI_SCALE = 0.8           # size of the on-screen dashboard (1.0 = default, 0.6 = small)
 
 CSRNET_WEIGHTS = os.path.join("weights", "PartAmodel_best.pth.tar")
 LWCC_WEIGHTS = "SHA"
@@ -77,6 +98,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================
 
 def load_counting_model():
+    """
+    The crowd-counting network (CSRNet) is pretrained and shared by all
+    cameras for INFERENCE only. It is not part of the federated averaging.
+    """
 
     if os.path.isfile(CSRNET_WEIGHTS):
         try:
@@ -214,6 +239,7 @@ def run_federated_pipeline():
                 show_vehicle_boxes=SHOW_VEHICLE_BOXES,
                 regulate=REGULATE,
                 approval=APPROVAL,
+                ui_scale=UI_SCALE,
             )
         )
         labels.append(label)
@@ -223,10 +249,10 @@ def run_federated_pipeline():
         return
 
     # --------------------------------------------------------
-    # Process each camera and train its local model
+    # Each camera analyses ITS OWN video (data stays on the client)
     # --------------------------------------------------------
 
-    for client, label in zip(clients, labels):
+    for client in clients:
 
         print(f"\nProcessing: {client.client_id} "
               f"(scene: {client.scene.label})")
@@ -236,30 +262,49 @@ def run_federated_pipeline():
 
             if summary is None:
                 print(f"[WARNING] Could not process {client.client_id}.")
-                continue
-
-            client.simulate_local_training(epochs=30, target_label=label)
 
         except Exception as error:
             print(f"[ERROR] {client.client_id} failed:", error)
             raise
 
-    trained = [c for c in clients if c.frames_processed > 0]
+    pairs = [
+        (c, l) for c, l in zip(clients, labels) if c.frames_processed > 0
+    ]
 
-    if not trained:
+    if not pairs:
         print("No clients successfully processed any frames.")
         return
 
+    trained = [c for c, _ in pairs]
+    trained_labels = [l for _, l in pairs]
+
     # --------------------------------------------------------
-    # 1) Federated averaging of the small model
+    # 1) Federated learning: multiple rounds of
+    #    broadcast -> local training -> weight upload -> FedAvg
     # --------------------------------------------------------
 
-    print("\nAggregating local models (FedAvg)...")
-
-    global_state = federated_average(
-        [c.get_model_weights() for c in trained],
-        [c.frames_processed for c in trained],
+    global_state, init_state, _ = run_federated_rounds(
+        trained,
+        trained_labels,
+        rounds=FED_ROUNDS,
+        local_epochs=LOCAL_EPOCHS,
+        clip_norm=DP_CLIP_NORM,
+        noise_multiplier=DP_NOISE_MULTIPLIER,
+        log_path=os.path.join(OUTPUT_DIR, "federated_rounds.csv"),
     )
+
+    if len(trained) >= 2:
+        compare_local_vs_global(
+            trained,
+            trained_labels,
+            init_state,
+            global_state,
+            epochs=FED_ROUNDS * LOCAL_EPOCHS,
+        )
+
+    # every client now holds the final global model
+    for client in trained:
+        client.set_model_weights(global_state)
 
     global_model = SimpleDensityModel(input_size=3)
     global_model.load_state_dict(global_state)
