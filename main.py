@@ -30,12 +30,12 @@ VIDEO_PATHS = [
     os.path.join(
         VIDEO_DIR,
         "stampede",
-        "gettyimages-2234292699-640_adpp.mp4",
+        "gettyimages-1144347847-640_adpp.mp4",
     ),
     os.path.join(
             VIDEO_DIR,
             "normal",
-            "Camera_2_output.mp4",
+            "Camera_1_output.mp4",
         ),
            
     # os.path.join(VIDEO_DIR, "normal", "your_calm_crowd_video.mp4"),

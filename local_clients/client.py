@@ -23,9 +23,27 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # Motion / risk constants
 MOVING_THRESHOLD = 0.3     # m/s, slower pixels are treated as standing
 MIN_MOVER_PEOPLE = 2.0     # people-equivalents needed to trust direction variance
-W_DENSITY, W_SPEED, W_DIR, W_INTERACT = 0.35, 0.25, 0.20, 0.20
-EMA_ALPHA = 0.30
-LOW_T, HIGH_T = 0.35, 0.65
+W_DENSITY, W_SPEED, W_DIR, W_INTERACT = 0.60, 0.20, 0.20, 0.00
+
+# Smoothing of the final risk: rises fast, falls slowly
+ATTACK_ALPHA = 0.50
+DECAY_ALPHA = 0.10
+
+# ------------------------------------------------------------------
+# RISK TUNING  (edit these to raise or lower the risk score)
+#
+# These OVERRIDE the scene profile (utils/scene_profiles.py).
+# Set any of them to None to use the scene profile's value instead.
+#
+#   DENSITY_CRITICAL : people/m2 at which the density score reaches 1.0
+#                      (lower = higher risk for the same crowd)
+#   SPEED_CRITICAL   : m/s at which the speed score reaches 1.0
+#   LOW_T / HIGH_T   : risk (0..1) where LOW -> MEDIUM -> HIGH switch
+# ------------------------------------------------------------------
+DENSITY_CRITICAL = 5.0
+SPEED_CRITICAL = 1.8
+LOW_T = 0.30
+HIGH_T = 0.45
 
 # Smoothing for the raw optical-flow readings (reduces frame-to-frame jitter)
 MOTION_EMA = 0.40
@@ -34,12 +52,6 @@ MOTION_EMA = 0.40
 HEAT_EMA = 0.25            # how fast the heatmap fades toward a new CSRNet result
 HEAT_MIN = 0.12            # fraction of peak density below which nothing is tinted
 
-# Heatmap colour scheme. Try any of:
-#   cv2.COLORMAP_JET      blue -> green -> yellow -> red   (classic crowd look)
-#   cv2.COLORMAP_TURBO    smoother version of JET
-#   cv2.COLORMAP_HOT      black -> red -> yellow -> white  (no blue)
-#   cv2.COLORMAP_INFERNO  black -> purple -> orange -> yellow
-#   cv2.COLORMAP_OCEAN    dark -> blue/teal -> white       (blue-toned)
 HEAT_COLORMAP = cv2.COLORMAP_JET
 
 
@@ -64,8 +76,8 @@ class LocalClient:
         flow_width=320,          # optical flow resolution
         px_per_meter=None,       # CALIBRATE THIS (pixels per metre in the crowd area)
         window_m=2.0,            # density window side in metres
-        density_critical=6.0,    # people/m2 that maps to density score 1.0
-        speed_critical=2.5,      # m/s that maps to speed score 1.0 (running)
+        density_critical=6.0,    # (overridden by DENSITY_CRITICAL / scene profile)
+        speed_critical=2.5,      # (overridden by SPEED_CRITICAL / scene profile)
         write_video=True,
         csv_dir="outputs",
         async_inference=True,    # run CSRNet in a background thread (display mode)
@@ -108,10 +120,26 @@ class LocalClient:
             vehicle_model=vehicle_model,
             draw_vehicles=show_vehicle_boxes,
         )
-        self.density_critical = self.scene.density_critical
-        self.speed_critical = self.scene.speed_critical
-        self.low_t = self.scene.low_t
-        self.high_t = self.scene.high_t
+
+        # The constants at the top of this file win over the scene profile.
+        # A constant set to None falls back to the profile's value.
+        self.density_critical = (
+            DENSITY_CRITICAL if DENSITY_CRITICAL is not None
+            else self.scene.density_critical
+        )
+        self.speed_critical = (
+            SPEED_CRITICAL if SPEED_CRITICAL is not None
+            else self.scene.speed_critical
+        )
+        self.low_t = LOW_T if LOW_T is not None else self.scene.low_t
+        self.high_t = HIGH_T if HIGH_T is not None else self.scene.high_t
+
+        print(
+            f"[{self.client_id}] risk settings: "
+            f"density_critical={self.density_critical}, "
+            f"speed_critical={self.speed_critical}, "
+            f"low_t={self.low_t}, high_t={self.high_t}"
+        )
 
         # Simulated regulation: turns the alert level into control actions.
         # Without a display there is nobody to press A/X, so it auto-approves.
@@ -424,16 +452,30 @@ class LocalClient:
         S = clip01(speed / self.speed_critical)
         V = clip01(dir_var)
 
-        raw = (
+        additive = (
             W_DENSITY * D
             + W_SPEED * S
             + W_DIR * V
             + W_INTERACT * D * V
         )
 
-        self._risk_smooth = (
-            EMA_ALPHA * raw + (1 - EMA_ALPHA) * self._risk_smooth
+        # Rush: fast AND disordered movement (panic running)
+        rush = S * (0.5 + 0.5 * V)
+
+        # Crush: a packed crowd is dangerous even if it barely moves.
+        # Starts at 2/3 of the critical density and reaches the HIGH
+        # threshold when the density equals the critical density.
+        dc = max(self.density_critical, 1e-6)
+        crush = clip01((density - 0.67 * dc) / (0.33 * dc)) * (
+            self.high_t + 0.15
         )
+
+        # Any strong danger pattern can drive the risk
+        raw = max(additive, rush, crush)
+
+        # Rise quickly, fall slowly
+        alpha = ATTACK_ALPHA if raw > self._risk_smooth else DECAY_ALPHA
+        self._risk_smooth = alpha * raw + (1 - alpha) * self._risk_smooth
 
         r = self._risk_smooth
 
